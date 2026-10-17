@@ -7,6 +7,7 @@ import tempfile
 
 import app_gui
 import valheim_character_editor as c
+import valheim_items
 from valheim_character_editor import Character, inv_rows_for, inv_rows_from_uniques
 
 
@@ -90,7 +91,42 @@ def collect_as_gui(items, rows):
     return app_gui.EditorApp._collect_inventory(st)
 
 
+def test_item_roundtrip():
+    # An item with every optional block: quality, stack, variant, crafter,
+    # custom data, plus the game's own low flag bits. Re-encoding it from the
+    # parsed fields must reproduce the bytes exactly.
+    raw = (struct.pack("<i", 35000) + bytes([3, 1, 0, 0xFF]) +
+           struct.pack("<HH", 4, 2) + struct.pack("<i", 7) +
+           struct.pack("<q", 953783831) + s("Mikeyy") +
+           struct.pack("<i", 1234) + bytes([1]) + s("k") + s("v") + bytes([1]))
+    it = c.read_item(c.Reader(raw))
+    assert (it["quality"], it["stack"], it["variant"]) == (4, 2, 7)
+    assert (it["crafter_id"], it["crafter_name"]) == (953783831, "Mikeyy")
+    assert it["custom"] == [("k", "v")] and it["cheated"]
+    assert c._write_item(it) == raw, "item re-encoding is lossy"
+    # editing a field keeps the extras
+    it["stack"] = 1
+    again = c.read_item(c.Reader(c._write_item(it)))
+    assert again["stack"] == 1 and again["crafter_name"] == "Mikeyy"
+    assert again["custom"] == [("k", "v")] and again["flags"] & 0x03 == 0x03
+    # a plain new item from the GUI needs none of the optional keys
+    assert c._write_item({"hash": 5, "x": 0, "y": 0, "stack": 1, "quality": 1,
+                          "durability": 100}) == item(5, 0, 0)
+    # a 3-byte varint string length still round-trips
+    long = "x" * 300
+    assert c.read_str(c._write_str(long), 0) == (long, len(c._write_str(long)))
+
+    # moving a slot rewrites only x/y, inside the raw bytes too
+    moved = app_gui.EditorApp._relocated(dict(it, raw=raw), (5, 2))
+    assert (moved["x"], moved["y"]) == (5, 2) and moved["raw"][4:6] == bytes([5, 2])
+    assert moved["raw"][6:] == raw[6:]
+    assert app_gui.pretty_name("ArmorPaddedCuirass") == "Armor Padded Cuirass"
+    assert app_gui.pretty_name("Fish4_cave") == "Fish 4 cave"
+    assert app_gui.pretty_name("HelmetDrake") == "Helmet Drake"
+
+
 def main():
+    test_item_roundtrip()
     # Row count comes out of the "invrows N" global key.
     assert inv_rows_from_uniques(["GP_Eikthyr", "invrows 6"]) == 6
     assert inv_rows_from_uniques(["invrows 4"]) == 4
@@ -147,14 +183,35 @@ def main():
         assert ch.player["inv_rows"] == 6, ch.player["inv_rows"]
         assert len(collect_as_gui(ch.player["inventory"], ch.player["inv_rows"])) == 2
 
-        # Valheim 1.0.20: profile 47 / player data 34, with new state appended
-        # after the last field the editor knows. Issue #4.
-        tail = b"\x07\x00\x00\x00drop-rng-state"
+        # Valheim 1.0.20: profile 47 / player data 34, with the drop-luck
+        # state appended after the last field the editor edits. Issue #4.
+        # Keys are prefab hash + chance in tenths of a percent.
+        h = valheim_items.ITEM_NAME_TO_HASH
+        tail = (struct.pack("<i", 3) +
+                struct.pack("<ii", h["TrophyNeck"] + 50, 21) +
+                struct.pack("<ii", h["TrophyHare"] + 100, 2) +
+                struct.pack("<ii", 12345, 1) +                 # unknown prefab
+                struct.pack("<i", 0))                           # empty 2nd list
         raw47 = build_fch(6, slots, 47, 34, tail)
         with open(path, "wb") as f:
             f.write(raw47)
         ch = Character(path)
         assert ch.player["version"] == 34
+        drops = ch.player["drops"]
+        assert [d["misses"] for d in drops] == [21, 2, 1], drops
+        rev = valheim_items.ITEM_HASH_TO_NAME
+        assert c.decode_drop_key(drops[0]["key"], rev) == ("TrophyNeck", 50)
+        assert c.decode_drop_key(drops[1]["key"], rev) == ("TrophyHare", 100)
+        assert c.decode_drop_key(drops[2]["key"], rev) == (None, None)
+        # a garbage count can't blow up the parse; it just yields nothing
+        junk = build_fch(6, slots, 47, 34, struct.pack("<i", 5) + b"\x01\x02")
+        with open(path, "wb") as f:
+            f.write(junk)
+        assert Character(path).player["drops"] == []
+        assert c.write_character(Character(path), None, {}, 0) == junk
+        with open(path, "wb") as f:
+            f.write(raw47)
+        ch = Character(path)
         assert sorted((i["x"], i["y"]) for i in ch.player["inventory"]) == want
         assert c.write_character(ch, None, {}, ch.profile["used_cheats"]) == raw47, \
             "idle save of a 1.0.20 file changed it"
