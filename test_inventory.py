@@ -20,10 +20,10 @@ def item(h, x, y, cheated=False):
             struct.pack("<i", h) + bytes([1 if cheated else 0]))
 
 
-def build_blob(rows, items):
+def build_blob(rows, items, version=33, tail=b""):
     # a minimal but structurally complete PlayerData blob
     b = bytearray()
-    b += struct.pack("<i", 33)                          # player data version
+    b += struct.pack("<i", version)                     # player data version
     b += struct.pack("<4f", 100.0, 100.0, 100.0, 0.0)   # health, stamina, tsd
     b += s("Eikthyr")                                   # guardian power
     b += struct.pack("<f", 0.0)                         # guardian power cooldown
@@ -42,12 +42,13 @@ def build_blob(rows, items):
     b += struct.pack("<i", 0)
     b += struct.pack("<3f", 10.0, 10.0, 10.0)           # stamina, maxEitr, eitr
     b += struct.pack("<i", 0)                           # trailing byte block
+    b += tail                                           # 1.0.20+ extra state
     return bytes(b)
 
 
-def build_profile(blob):
+def build_profile(blob, version=46):
     b = bytearray()
-    b += struct.pack("<iii", 46, 205, 1)     # profile version, stats, buckets
+    b += struct.pack("<iii", version, 205, 1)  # profile version, stats, buckets
     b += bytes(4 * 205)                      # one float per stat
     b += struct.pack("<i", 0) * 9            # eight float dicts + sub count
     b += bytes([0])                          # first spawn
@@ -60,10 +61,21 @@ def build_profile(blob):
     return bytes(b)
 
 
-def build_fch(rows, items):
-    body = build_profile(build_blob(rows, items))
+def build_fch(rows, items, profile_version=46, data_version=33, tail=b""):
+    body = build_profile(build_blob(rows, items, data_version, tail), profile_version)
     return (struct.pack("<i", len(body)) + body +
             struct.pack("<i", 64) + hashlib.sha512(body).digest())
+
+
+def expect_parse_error(raw, path, needle):
+    with open(path, "wb") as f:
+        f.write(raw)
+    try:
+        Character(path)
+    except c.ParseError as e:
+        assert needle in str(e), str(e)
+    else:
+        raise AssertionError("accepted a file it should reject: %s" % needle)
 
 
 class Stub:
@@ -134,6 +146,40 @@ def main():
         ch = Character(path)
         assert ch.player["inv_rows"] == 6, ch.player["inv_rows"]
         assert len(collect_as_gui(ch.player["inventory"], ch.player["inv_rows"])) == 2
+
+        # Valheim 1.0.20: profile 47 / player data 34, with new state appended
+        # after the last field the editor knows. Issue #4.
+        tail = b"\x07\x00\x00\x00drop-rng-state"
+        raw47 = build_fch(6, slots, 47, 34, tail)
+        with open(path, "wb") as f:
+            f.write(raw47)
+        ch = Character(path)
+        assert ch.player["version"] == 34
+        assert sorted((i["x"], i["y"]) for i in ch.player["inventory"]) == want
+        assert c.write_character(ch, None, {}, ch.profile["used_cheats"]) == raw47, \
+            "idle save of a 1.0.20 file changed it"
+        # editing the inventory and skills keeps the unknown tail intact
+        kept = collect_as_gui(ch.player["inventory"], ch.player["inv_rows"])
+        out = c.write_character(ch, {1: (20.0, 0.0), 2: (5.0, 0.0)}, {"health": 50.0},
+                                False, True, list(kept)[:2])
+        assert out.endswith(tail + struct.pack("<i", 64) + hashlib.sha512(
+            out[4:-68]).digest()), "tail lost on save"
+        with open(path, "wb") as f:
+            f.write(out)
+        again = Character(path)
+        assert len(again.player["inventory"]) == 2
+        assert [s["type"] for s in again.skills] == [1, 2]
+
+        # a 34 blob whose last length prefix overruns the data is still rejected
+        short = build_blob(4, [], 34)[:-4] + struct.pack("<i", 99)
+        body = build_profile(short, 47)
+        expect_parse_error(struct.pack("<i", len(body)) + body + struct.pack("<i", 64) +
+                           hashlib.sha512(body).digest(), path, "end mismatch")
+        # a 33 blob with unexplained bytes at the end is still rejected
+        expect_parse_error(build_fch(4, [], 46, 33, b"xx"), path, "end mismatch")
+        # and versions past what we know stay refused with a clear message
+        expect_parse_error(build_fch(4, [], 48, 34), path, "profile version 48")
+        expect_parse_error(build_fch(4, [], 47, 35), path, "player data version 35")
 
         print("test_inventory: OK")
         return 0

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import struct, hashlib, sys, os, shutil, datetime
 
-PROFILE_VERSION = 46
-PLAYERDATA_VERSION = 33
+# Valheim 1.0.20 bumped both (46/33 -> 47/34) without changing the layout
+# this editor reads; 34 only appends data after the last field we touch.
+PROFILE_VERSIONS = (46, 47)
+PLAYERDATA_VERSIONS = (33, 34)
 INV_ROWS_FALLBACK = 4      # backpack rows before any upgrade
 INV_ROWS_MAX = 256         # y is one byte, so no item can sit past row 255
 
@@ -29,6 +31,10 @@ BASE_FIELDS = [
 
 class ParseError(Exception):
     pass
+
+
+def _fmt_versions(vs):
+    return "%d-%d" % (min(vs), max(vs)) if len(vs) > 1 else str(vs[0])
 
 
 def _varint(b, o):
@@ -129,9 +135,9 @@ def read_item(r):
 def parse_profile(body):
     r = Reader(body)
     ver = r.i32(); nstats = r.i32(); nbuckets = r.i32()
-    if ver != PROFILE_VERSION:
-        raise ParseError("profile version %d (only %d is supported - the current game)"
-                         % (ver, PROFILE_VERSION))
+    if ver not in PROFILE_VERSIONS:
+        raise ParseError("profile version %d (supported: %s - the current game)"
+                         % (ver, _fmt_versions(PROFILE_VERSIONS)))
     if nstats != 205 or not (1 <= nbuckets <= 20):
         raise ParseError("unexpected parameters (stats=%d, buckets=%d)" % (nstats, nbuckets))
     for _ in range(nbuckets):
@@ -203,9 +209,9 @@ def inv_rows_for(items, declared):
 def parse_blob(blob):
     r = Reader(blob)
     pd = r.i32()
-    if pd != PLAYERDATA_VERSION:
-        raise ParseError("player data version %d (only %d is supported)"
-                         % (pd, PLAYERDATA_VERSION))
+    if pd not in PLAYERDATA_VERSIONS:
+        raise ParseError("player data version %d (supported: %s)"
+                         % (pd, _fmt_versions(PLAYERDATA_VERSIONS)))
 
     base = {}
     off = r.o
@@ -263,8 +269,12 @@ def parse_blob(blob):
     off = r.o; base["maxEitr"] = off; r.f32()
     off = r.o; base["eitr"] = off; r.f32()
     ln = r.i32(); r.o += ln
-    if r.o != len(blob):
-        raise ParseError("player data end mismatch (%d of %d)" % (r.o, len(blob)))
+    tail_off = r.o
+    # Player data 34 (game 1.0.20) carries extra state past this point that
+    # the editor doesn't model. Every write below patches the blob in place,
+    # so whatever sits there is kept byte for byte.
+    if tail_off > len(blob) or (pd < 34 and tail_off != len(blob)):
+        raise ParseError("player data end mismatch (%d of %d)" % (tail_off, len(blob)))
 
     return {
         "base": base,
@@ -275,6 +285,7 @@ def parse_blob(blob):
         "inv_count_off": inv_count_off, "inv_items_end": inv_items_end,
         "sk_ver_off": sk_ver_off, "sk_count_off": sk_count_off,
         "sk_entries_off": sk_entries_off, "sk_end_off": sk_end_off,
+        "version": pd, "tail_off": tail_off,
     }
 
 
